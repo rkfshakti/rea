@@ -448,6 +448,69 @@ describe("captured script output owner retry", () => {
 });
 
 describe("captured script publication failures and cleanup", () => {
+  it("retains cancellation as the primary failure when rollback also fails", async () => {
+    const { input, resources } = await setup(
+      scriptScenarioFixture([
+        {
+          url: "https://fixture.test/first.js",
+          bytes: Buffer.from("export const first = 1;"),
+        },
+        {
+          url: "https://fixture.test/second.js",
+          bytes: Buffer.from("export const second = 2;"),
+        },
+      ]),
+    );
+    const controller = new AbortController();
+    const reason = new Error("caller requested stop");
+    const createTree = SafeOutputTree.create.bind(SafeOutputTree);
+    let cleanupAttempts = 0;
+    const create = vi
+      .spyOn(SafeOutputTree, "create")
+      .mockImplementationOnce(async (outputRoot, platform) => {
+        const tree = await createTree(outputRoot, platform);
+        const write = tree.write.bind(tree);
+        vi.spyOn(tree, "write").mockImplementationOnce(async (...writeArgs) => {
+          const written = await write(...writeArgs);
+          controller.abort(reason);
+          return written;
+        });
+        const rollback = tree.rollback.bind(tree);
+        vi.spyOn(tree, "rollback").mockImplementation(async () => {
+          cleanupAttempts += 1;
+          if (cleanupAttempts === 1)
+            throw new Error("controlled rollback rejection");
+          return rollback();
+        });
+        return tree;
+      });
+    try {
+      const result = await exportWebScripts(input, resources, {
+        signal: controller.signal,
+      });
+      if (result.ok) throw new Error("Expected cancellation");
+      expect(result.error._tag).toBe("AnalysisCancelledError");
+      expect(result.error.cause).toBe(reason);
+      expect(result.error.cleanupIncomplete).toBe(true);
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "cleanup_incomplete",
+        details: {
+          execution_failure: "cancelled",
+          resources: [input.output_directory],
+        },
+      });
+      expect(resources.hasPending).toBe(true);
+      await expect(access(input.output_directory)).resolves.toBeUndefined();
+      await resources.close();
+      expect(cleanupAttempts).toBe(2);
+      await expect(access(input.output_directory)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      create.mockRestore();
+    }
+  });
+
   it("cancels before work and rolls back cancellation after output creation", async () => {
     const { root, input, resources } = await setup();
     const controller = new AbortController();

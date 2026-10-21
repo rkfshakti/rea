@@ -7,6 +7,7 @@ import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js"
 import { DESTINATION_CASE_COLLISION_PREFIX } from "../../artifacts/ArtifactPaths.js";
 import { SafeOutputTree } from "../../artifacts/SafeOutputTree.js";
 import { SafeOutputTreeCreationFailure } from "../../artifacts/SafeOutputTreeCreationFailure.js";
+import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
 import { PLAYWRIGHT_RESPONSE_BODY_PROVENANCE_LIMITATION } from "../../domain/browserNetworkEvidence.js";
 import {
   webScriptExportManifestSchema,
@@ -21,6 +22,8 @@ import {
 } from "../../domain/webScriptExportPlan.js";
 import { WebScriptExportError } from "../../domain/webScriptExportError.js";
 import type { SelectedScriptCapture } from "./ScriptCaptureAdapters.js";
+
+const OPERATION = "export_web_scripts";
 
 const LIMITATIONS = [
   "Only script bytes retained in this capture are exported. Sources are not refetched or executed, and a response or Debugger source does not prove execution.",
@@ -125,14 +128,29 @@ export const publishWebScripts = async (
         });
         if (cleanup.kind === "failed") {
           const cleanupCause = cleanup.cause;
+          const cleanupReason = message(cleanupCause);
+          if (
+            !tree.published &&
+            (options.signal?.aborted === true ||
+              cause instanceof AnalysisCancelledError ||
+              (cause instanceof ArtifactReaderFailure &&
+                cause.reason === "cancelled"))
+          )
+            throw new AnalysisCancelledError(OPERATION, {
+              cause: cancellationReason(cause),
+              cleanup: {
+                reason: cleanupReason,
+                resources: [tree.outputRoot],
+              },
+            });
           const diagnostic = tree.published
-            ? `Publication completed, but descriptor cleanup failed (${message(cleanupCause)}). The published output remains available.`
-            : `Publication failed (${message(cause)}); rollback failed (${message(cleanupCause)}). Remove the residual output directory before retrying.`;
+            ? `Publication completed, but descriptor cleanup failed (${cleanupReason}). The published output remains available.`
+            : `Publication failed (${message(cause)}); rollback failed (${cleanupReason}). Remove the residual output directory before retrying.`;
           const error = new WebScriptExportError(
             cause instanceof ArtifactReaderFailure ? cause.reason : "io",
             tree.outputRoot,
             diagnostic,
-            { residualPaths: [tree.outputRoot] },
+            { cause, residualPaths: [tree.outputRoot] },
           );
           if (tree.published && result !== undefined)
             error.retainPartialObservation({
@@ -197,6 +215,13 @@ const destinationCollisionReason = (cause: unknown): string | undefined =>
   cause.message.startsWith(DESTINATION_CASE_COLLISION_PREFIX)
     ? cause.message
     : undefined;
+
+const cancellationReason = (cause: unknown): unknown =>
+  cause instanceof AnalysisCancelledError
+    ? cause.cause
+    : cause instanceof ArtifactReaderFailure
+      ? (cause.cancellation?.reason ?? cause)
+      : cause;
 
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : "Unknown publication failure";
